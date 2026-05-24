@@ -10,13 +10,27 @@ find_package(CURL REQUIRED)
 # Find nlohmann/json (install via vcpkg, conan, or system package manager)
 find_package(nlohmann_json 3.2.0 REQUIRED)
 
-# Example executable
-add_executable(authcord_example examples/basic.cpp)
+# Threads is needed by the heartbeat example (and recommended for any
+# real consumer of the SDK because of HeartbeatLoop's std::thread).
+find_package(Threads REQUIRED)
 
-target_include_directories(authcord_example PRIVATE include)
+# Example executables
+add_executable(authcord_example examples/basic.cpp)
+add_executable(authcord_heartbeat_example examples/heartbeat.cpp)
+
+target_include_directories(authcord_example          PRIVATE include)
+target_include_directories(authcord_heartbeat_example PRIVATE include)
 
 target_link_libraries(authcord_example
     PRIVATE
         CURL::libcurl
         nlohmann_json::nlohmann_json
+        Threads::Threads
+)
+
+target_link_libraries(authcord_heartbeat_example
+    PRIVATE
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
+        Threads::Threads
 )

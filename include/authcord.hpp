@@ -21,6 +21,13 @@
 #include <map>
 #include <stdexcept>
 #include <sstream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <functional>
+#include <memory>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
@@ -141,6 +148,70 @@ struct Session {
     std::string expires_at;
     std::string revoked_at;
     bool is_active = false;
+};
+
+/**
+ * Result of a heartbeat check.
+ *
+ * `valid` is false when an admin has terminated the device/session, the
+ * user has been banned/paused, the product expired, or the HWID was
+ * unbound. `reason` carries the machine-readable code so the client can
+ * branch on it (e.g. "terminated", "banned", "expired", "hwid_unbound").
+ * `next_heartbeat_in` is server-controlled; the auto-heartbeat loop
+ * honours it unless the caller pinned an interval.
+ */
+struct HeartbeatResult {
+    bool valid = false;
+    std::string reason;
+    int next_heartbeat_in = 10;
+};
+
+/**
+ * RAII handle for a running heartbeat loop. Stops the loop on destruction
+ * or when stop() is called. Move-only — copying a running loop doesn't
+ * make sense.
+ */
+class HeartbeatLoop {
+public:
+    struct SharedState {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::atomic<bool> stopped{false};
+    };
+
+    HeartbeatLoop() = default;
+    HeartbeatLoop(std::shared_ptr<SharedState> state, std::thread t)
+        : state_(std::move(state)), thread_(std::move(t)) {}
+
+    ~HeartbeatLoop() { stop(); }
+
+    HeartbeatLoop(const HeartbeatLoop&) = delete;
+    HeartbeatLoop& operator=(const HeartbeatLoop&) = delete;
+    HeartbeatLoop(HeartbeatLoop&& other) noexcept = default;
+    HeartbeatLoop& operator=(HeartbeatLoop&& other) noexcept {
+        if (this != &other) {
+            stop();
+            state_ = std::move(other.state_);
+            thread_ = std::move(other.thread_);
+        }
+        return *this;
+    }
+
+    void stop() {
+        if (!state_) return;
+        state_->stopped.store(true);
+        state_->cv.notify_all();
+        if (thread_.joinable()) thread_.join();
+        state_.reset();
+    }
+
+    bool is_running() const noexcept {
+        return state_ && !state_->stopped.load();
+    }
+
+private:
+    std::shared_ptr<SharedState> state_;
+    std::thread thread_;
 };
 
 // ─── Client ─────────────────────────────────────────────────────────────────
@@ -300,6 +371,97 @@ public:
     }
 
     /**
+     * Single heartbeat check — returns whether the user's session is
+     * still live. Pass `session_token` (DeviceSession flow) OR both
+     * `discord_id` and `hwid` (validate-only flow). The endpoint is
+     * cheap and rate-limited to ~2/sec/IP on the server side; intended
+     * to be called every few seconds from your app's main loop.
+     */
+    HeartbeatResult heartbeat(
+        const std::string& app_id,
+        const std::string& discord_id = "",
+        const std::string& hwid = "",
+        const std::string& session_token = "")
+    {
+        if (session_token.empty() && (discord_id.empty() || hwid.empty())) {
+            throw std::invalid_argument(
+                "heartbeat: provide session_token, or both discord_id and hwid");
+        }
+        nlohmann::json body = {{"app_id", app_id}};
+        if (!session_token.empty()) body["session_token"] = session_token;
+        if (!discord_id.empty())    body["discord_id"]    = discord_id;
+        if (!hwid.empty())          body["hwid"]          = hwid;
+
+        auto resp = request("POST", "/api/v1/auth/heartbeat", body);
+        HeartbeatResult result;
+        result.valid             = resp.value("valid", false);
+        result.reason            = resp.value("reason", std::string{});
+        result.next_heartbeat_in = resp.value("next_heartbeat_in", 10);
+        return result;
+    }
+
+    /**
+     * Start a background heartbeat loop. Invokes `on_terminated` exactly
+     * once when the server returns `valid=false` (admin clicked
+     * Terminate, user banned, product expired, ...) and then the loop
+     * stops on its own. Returns a RAII handle — destroying it (or
+     * calling .stop()) cancels the loop and joins the thread.
+     *
+     * Network errors are passed to `on_error` (if set) and the loop
+     * keeps polling. When `interval_seconds` is 0 the loop honours the
+     * server-suggested `next_heartbeat_in` between calls.
+     */
+    HeartbeatLoop start_heartbeat(
+        const std::string& app_id,
+        std::function<void(const HeartbeatResult&)> on_terminated,
+        const std::string& discord_id = "",
+        const std::string& hwid = "",
+        const std::string& session_token = "",
+        int interval_seconds = 0,
+        std::function<void(const std::exception&)> on_error = nullptr)
+    {
+        if (session_token.empty() && (discord_id.empty() || hwid.empty())) {
+            throw std::invalid_argument(
+                "start_heartbeat: provide session_token, or both discord_id and hwid");
+        }
+
+        auto state = std::make_shared<HeartbeatLoop::SharedState>();
+        // Capture `this` — the SDK is a single-header lib; lifetime of
+        // the client must outlive the loop, same contract as the other
+        // SDKs. Document this on the caller side.
+        std::thread t([this, state, app_id, discord_id, hwid, session_token,
+                       interval_seconds, on_terminated, on_error]() {
+            int wait_seconds = interval_seconds > 0 ? interval_seconds : 10;
+            while (!state->stopped.load()) {
+                {
+                    std::unique_lock<std::mutex> lock(state->mtx);
+                    state->cv.wait_for(lock, std::chrono::seconds(wait_seconds),
+                        [&] { return state->stopped.load(); });
+                }
+                if (state->stopped.load()) return;
+
+                HeartbeatResult result;
+                try {
+                    result = this->heartbeat(app_id, discord_id, hwid, session_token);
+                } catch (const std::exception& ex) {
+                    if (on_error) {
+                        try { on_error(ex); } catch (...) { /* swallow */ }
+                    }
+                    continue;
+                }
+                if (!result.valid) {
+                    try { on_terminated(result); } catch (...) { /* swallow */ }
+                    return;
+                }
+                if (interval_seconds == 0) {
+                    wait_seconds = std::max(1, result.next_heartbeat_in);
+                }
+            }
+        });
+        return HeartbeatLoop(state, std::move(t));
+    }
+
+    /**
      * Revoke all sessions for a user in an app. Returns count revoked.
      */
     int revoke_all_sessions(const std::string& discord_id, const std::string& app_id) {
@@ -421,7 +583,7 @@ private:
         headers = curl_slist_append(headers, api_key_header.c_str());
         headers = curl_slist_append(headers, "Content-Type: application/json");
         headers = curl_slist_append(headers, "Accept: application/json");
-        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.0.0");
+        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.1.0");
         curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
 
         // Write callback

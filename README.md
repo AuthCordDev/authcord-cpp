@@ -60,6 +60,40 @@ int main() {
 }
 ```
 
+## Real-time Session Kick (Heartbeat)
+
+After `validate()` succeeds, start a background heartbeat so an admin clicking **Terminate** in the dashboard takes effect within ~10 seconds instead of waiting for the user's next manual validate.
+
+```cpp
+#include "authcord.hpp"
+#include <iostream>
+
+authcord::AuthCordClient client("dax_your_api_key");
+
+auto loop = client.start_heartbeat(
+    /*app_id*/      "your_app_id",
+    /*on_terminated*/ [](const authcord::HeartbeatResult& hb) {
+        std::cerr << "Session ended: " << hb.reason << std::endl;
+        // Tear down: close windows, clear in-memory secrets, exit, etc.
+        std::exit(0);
+    },
+    /*discord_id*/  "123456789",
+    /*hwid*/        "HWID-ABC",
+    /*session_token*/ "",
+    /*interval_seconds*/ 0,  // 0 = honour server-suggested cadence
+    /*on_error*/    [](const std::exception& ex) {
+        // Network errors are non-fatal — the loop keeps polling.
+        std::cerr << "[heartbeat] " << ex.what() << std::endl;
+    });
+
+// ... your app does its thing ...
+// loop.stop() is called automatically when `loop` goes out of scope.
+```
+
+The returned `HeartbeatLoop` is RAII — destroying it (or calling `loop.stop()`) cancels the loop and joins the thread. Reason codes on `valid=false`: `terminated`, `banned`, `paused`, `expired`, `product_expired`, `hwid_unbound`.
+
+For a DeviceSession-based flow, pass `session_token` instead of `discord_id` + `hwid`. Full runnable example in `examples/heartbeat.cpp`.
+
 ## Email-Based Validation
 
 AuthCord supports validating users by Discord ID, user ID, or email:
