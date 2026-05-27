@@ -31,6 +31,21 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+  #include <sddl.h>     // ConvertSidToStringSidA
+  #include <intrin.h>   // __cpuid
+  // Link Advapi32.lib for SID and registry APIs. Most build systems
+  // pick this up automatically with MSVC's pragma; MinGW/Clang users
+  // may need -lAdvapi32 on the link line.
+  #ifdef _MSC_VER
+    #pragma comment(lib, "Advapi32.lib")
+  #endif
+#endif
+
 namespace authcord {
 
 // ─── Exceptions ─────────────────────────────────────────────────────────────
@@ -151,6 +166,29 @@ struct Session {
 };
 
 /**
+ * Structured HWID components the SDK can send instead of (or alongside) a
+ * single opaque `hwid` string. The server combines a configured subset of
+ * these — controlled by the app's HWID Strategy in the dashboard — to
+ * derive the canonical HWID used for slot matching.
+ *
+ * Typical "temp HWID spoofers" (used by cheaters to evade FiveM-style
+ * bans) change SMBIOS UUID, disk serial, MAC, and MachineGuid — but
+ * NOT the Windows User SID or CPUID. An app set to "STABLE" strategy
+ * hashes only (sid + cpu_id), so users stay bound across spoofs and
+ * don't get locked out of licenses they paid for.
+ *
+ * See collect_hwid_components() below for a Windows populating helper.
+ * On non-Windows platforms, leave fields empty or fill them yourself.
+ */
+struct HwidComponents {
+    std::string sid;           // Windows User SID (S-1-5-21-...) — survives temp spoofers
+    std::string cpu_id;        // CPUID signature — silicon, hard to fake
+    std::string machine_guid;  // Windows MachineGuid registry value
+    std::string mac;           // primary NIC MAC
+    std::string disk;          // boot disk serial
+};
+
+/**
  * Result of a heartbeat check.
  *
  * `valid` is false when an admin has terminated the device/session, the
@@ -213,6 +251,90 @@ private:
     std::shared_ptr<SharedState> state_;
     std::thread thread_;
 };
+
+// ─── HWID component collection (Windows) ────────────────────────────────────
+
+/**
+ * Best-effort Windows HWID component collector. Populates `sid`, `cpu_id`,
+ * and `machine_guid` from the running process's identity, the CPU silicon,
+ * and the registry. Leaves fields blank on failure rather than throwing
+ * — callers can still pass a partial result.
+ *
+ * `mac` and `disk` aren't populated here because they typically require
+ * WMI (heavy) or admin-privileged APIs; if your app already collects
+ * them for other reasons, fill those fields yourself before calling
+ * validate(). The default Stable strategy on the server hashes only
+ * `sid` + `cpu_id`, so those two are sufficient for the spoofer-
+ * resistance use case.
+ *
+ * Returns an empty struct on non-Windows platforms. Cross-platform
+ * callers should fill the struct themselves with whatever stable
+ * identifiers they can collect.
+ */
+inline HwidComponents collect_hwid_components() {
+    HwidComponents out;
+#ifdef _WIN32
+    // ── Windows User SID ──
+    // S-1-5-21-X-Y-Z-RID — generated at Windows install, stored in the
+    // SAM. Temp HWID spoofers don't touch this because changing it
+    // breaks the user profile.
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        DWORD needed = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+        if (needed > 0) {
+            std::vector<BYTE> buffer(needed);
+            if (GetTokenInformation(token, TokenUser, buffer.data(), needed, &needed)) {
+                PSID sid = reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid;
+                LPSTR sid_str = nullptr;
+                if (ConvertSidToStringSidA(sid, &sid_str)) {
+                    out.sid = sid_str;
+                    LocalFree(sid_str);
+                }
+            }
+        }
+        CloseHandle(token);
+    }
+
+    // ── CPUID signature ──
+    // Leaf 1 EAX = family/model/stepping; EBX = brand index + APIC; ECX/EDX
+    // = feature flags. Not per-chip-unique (Intel deprecated PSN in P3 era)
+    // but stable across spoofers and identical across reboots.
+    {
+        int cpu_info[4] = {0, 0, 0, 0};
+        __cpuid(cpu_info, 1);
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%08X%08X%08X%08X",
+            static_cast<unsigned>(cpu_info[0]),
+            static_cast<unsigned>(cpu_info[1]),
+            static_cast<unsigned>(cpu_info[2]),
+            static_cast<unsigned>(cpu_info[3]));
+        out.cpu_id = buf;
+    }
+
+    // ── Windows MachineGuid ──
+    // Easier to spoof than the SID (it's just a registry value) but free
+    // to collect and useful for STRICT strategy.
+    {
+        HKEY key = nullptr;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                          "SOFTWARE\\Microsoft\\Cryptography",
+                          0, KEY_READ | KEY_WOW64_64KEY, &key) == ERROR_SUCCESS) {
+            char value[128] = {0};
+            DWORD size = sizeof(value);
+            DWORD type = 0;
+            if (RegQueryValueExA(key, "MachineGuid", nullptr, &type,
+                                 reinterpret_cast<BYTE*>(value), &size) == ERROR_SUCCESS) {
+                // Strip the trailing NUL if registry reported it as part of size
+                if (size > 0 && value[size - 1] == '\0') size--;
+                out.machine_guid.assign(value, size);
+            }
+            RegCloseKey(key);
+        }
+    }
+#endif
+    return out;
+}
 
 // ─── Client ─────────────────────────────────────────────────────────────────
 
@@ -315,6 +437,53 @@ public:
     }
 
     /**
+     * Validate using structured HWID components.
+     *
+     * The server derives the canonical HWID from a subset of the
+     * components based on the app's HWID Strategy setting:
+     *   - LEGACY (default): components ignored, opaque `hwid` string used.
+     *   - STABLE: server hashes (sid + cpu_id) — spoofer-resistant.
+     *   - STRICT: server hashes (sid + cpu + machine_guid + mac + disk).
+     *
+     * The `hwid` argument is still useful as a back-compat fallback:
+     * the server uses it when components are missing or empty, so apps
+     * that flip their strategy before all clients have updated continue
+     * to work.
+     */
+    ValidationResult validate(
+        const std::string& app_id,
+        const std::string& discord_id,
+        const HwidComponents& components,
+        const std::string& hwid = "",
+        const std::string& user_id = "",
+        const std::string& email = "",
+        const std::string& product_id = "")
+    {
+        if (discord_id.empty() && user_id.empty() && email.empty()) {
+            throw AuthCordError("At least one of discord_id, user_id, or email is required.");
+        }
+        nlohmann::json body = {
+            {"app_id", app_id}
+        };
+        if (!discord_id.empty()) body["discord_id"] = discord_id;
+        if (!user_id.empty()) body["user_id"] = user_id;
+        if (!email.empty()) body["email"] = email;
+        if (!product_id.empty()) body["product_id"] = product_id;
+        if (!hwid.empty()) body["hwid"] = hwid;
+
+        nlohmann::json comp = nlohmann::json::object();
+        if (!components.sid.empty())          comp["sid"]          = components.sid;
+        if (!components.cpu_id.empty())       comp["cpu_id"]       = components.cpu_id;
+        if (!components.machine_guid.empty()) comp["machine_guid"] = components.machine_guid;
+        if (!components.mac.empty())          comp["mac"]          = components.mac;
+        if (!components.disk.empty())         comp["disk"]         = components.disk;
+        if (!comp.empty()) body["hwid_components"] = comp;
+
+        auto resp = request("POST", "/api/v1/auth/validate", body);
+        return parse_validation_result(resp);
+    }
+
+    /**
      * Create a persistent device session.
      *
      * At least one of discord_id, user_id, or email must be non-empty.
@@ -391,6 +560,46 @@ public:
         if (!session_token.empty()) body["session_token"] = session_token;
         if (!discord_id.empty())    body["discord_id"]    = discord_id;
         if (!hwid.empty())          body["hwid"]          = hwid;
+
+        auto resp = request("POST", "/api/v1/auth/heartbeat", body);
+        HeartbeatResult result;
+        result.valid             = resp.value("valid", false);
+        result.reason            = resp.value("reason", std::string{});
+        result.next_heartbeat_in = resp.value("next_heartbeat_in", 10);
+        return result;
+    }
+
+    /**
+     * Heartbeat overload that sends structured HWID components.
+     *
+     * Use this when your app has been updated to send components on
+     * validate — the heartbeat must use the same derivation so the slot
+     * lookup hits the right row on STABLE/STRICT-strategy apps.
+     * Pass `hwid` too as a back-compat fallback when the app's
+     * strategy is still LEGACY.
+     */
+    HeartbeatResult heartbeat(
+        const std::string& app_id,
+        const std::string& discord_id,
+        const HwidComponents& components,
+        const std::string& hwid = "")
+    {
+        if (discord_id.empty()) {
+            throw std::invalid_argument("heartbeat: discord_id is required");
+        }
+        nlohmann::json body = {
+            {"app_id", app_id},
+            {"discord_id", discord_id},
+        };
+        if (!hwid.empty()) body["hwid"] = hwid;
+
+        nlohmann::json comp = nlohmann::json::object();
+        if (!components.sid.empty())          comp["sid"]          = components.sid;
+        if (!components.cpu_id.empty())       comp["cpu_id"]       = components.cpu_id;
+        if (!components.machine_guid.empty()) comp["machine_guid"] = components.machine_guid;
+        if (!components.mac.empty())          comp["mac"]          = components.mac;
+        if (!components.disk.empty())         comp["disk"]         = components.disk;
+        if (!comp.empty()) body["hwid_components"] = comp;
 
         auto resp = request("POST", "/api/v1/auth/heartbeat", body);
         HeartbeatResult result;
@@ -583,7 +792,7 @@ private:
         headers = curl_slist_append(headers, api_key_header.c_str());
         headers = curl_slist_append(headers, "Content-Type: application/json");
         headers = curl_slist_append(headers, "Accept: application/json");
-        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.1.0");
+        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.2.0");
         curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
 
         // Write callback

@@ -60,6 +60,32 @@ int main() {
 }
 ```
 
+## Spoofer-resistant HWID (v1.2+)
+
+The default `validate(app_id, discord_id, ..., hwid)` sends one opaque HWID string. If your users legitimately temp-spoof their hardware (e.g. FiveM cheat customers evading server bans), the HWID your client built changes with the spoof and your user gets locked out of a license they paid for.
+
+Use the **HwidComponents** overload + flip your app's **HWID Strategy** to `STABLE` on the dashboard. The server then derives the canonical HWID from `sid + cpu_id` only — temp HWID spoofers don't touch the Windows User SID or the CPUID, so the same user stays bound across spoofs.
+
+```cpp
+#include "authcord.hpp"
+
+authcord::AuthCordClient client("dax_your_api_key");
+
+// Windows: populates SID + CPUID + MachineGuid via Win32 APIs.
+// Non-Windows: returns empty; fill the struct yourself.
+auto components = authcord::collect_hwid_components();
+
+auto result = client.validate(
+    /*app_id*/      "your_app_id",
+    /*discord_id*/  "123456789",
+    /*components*/  components,
+    /*hwid*/        "your_existing_hwid_string");  // back-compat fallback
+```
+
+**Backwards-compatible:** the legacy `hwid` arg is still honoured on `LEGACY`-strategy apps, and the server falls back to it whenever components are absent. You can ship a new SDK build to your users **before** flipping the dashboard setting — nobody gets locked out during the rollout. Use the matching `heartbeat()` overload so the heartbeat loop sends components too.
+
+Windows builds: link `Advapi32` (the CMakeLists already does this for the bundled example). Full example: `examples/hwid_components.cpp`.
+
 ## Real-time Session Kick (Heartbeat)
 
 After `validate()` succeeds, start a background heartbeat so an admin clicking **Terminate** in the dashboard takes effect within ~10 seconds instead of waiting for the user's next manual validate.
