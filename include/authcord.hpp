@@ -204,6 +204,59 @@ struct HeartbeatResult {
     int next_heartbeat_in = 10;
 };
 
+// ───────────────────────────────────────────────────────────────────────────
+// Admin operation results (server-side, FULL API key only)
+//
+// `success` is false for the expected 404 cases (carrying a machine `error`
+// code + human `reason`) and the 409 already-paused case. Check it before
+// reading the data fields. `status` is the HTTP status code.
+// ───────────────────────────────────────────────────────────────────────────
+
+struct PausedProduct {
+    std::string product_id;
+    std::string paused_at;
+    std::string pause_ends_at;
+    std::string frozen_expires_at;
+};
+
+struct PauseResult {
+    bool success = false;
+    long status = 0;
+    std::vector<PausedProduct> paused;
+    std::string error;    // machine code: "user_not_found", "already_paused", ...
+    std::string reason;   // human string (404 cases)
+    std::string message;  // 409 already-paused message
+};
+
+struct UnpausedProduct {
+    std::string product_id;
+    std::string new_expires_at;
+};
+
+struct UnpauseResult {
+    bool success = false;
+    long status = 0;
+    std::vector<UnpausedProduct> unpaused;
+    std::string error;
+    std::string reason;
+};
+
+struct HwidResetEntry {
+    std::string product_id;
+    int cleared_hwids = 0;      // idempotent: nothing bound reports 0
+    bool on_cooldown = false;   // skipped: still inside its reset cooldown
+    std::string cooldown_ends_at;  // set when on_cooldown is true (ISO 8601)
+};
+
+struct ResetHwidResult {
+    bool success = false;
+    long status = 0;
+    std::vector<HwidResetEntry> reset;
+    std::string cooldown_ends_at;  // soonest blocked cooldown end (409 cooldown_active only)
+    std::string error;
+    std::string reason;
+};
+
 /**
  * RAII handle for a running heartbeat loop. Stops the loop on destruction
  * or when stop() is called. Move-only — copying a running loop doesn't
@@ -740,6 +793,147 @@ public:
         return request("GET", path);
     }
 
+    // ─── Admin operations — server-side only, require a FULL API key ─────────
+
+    /**
+     * Pause (freeze the expiry clock) one product — or every product the user
+     * owns on the app when product_id is empty — for `days` days.
+     *
+     * Server-side only. Requires a FULL API key (a CLIENT key gets 403).
+     *
+     * Does not throw on the expected 404 cases (app/user/product not found,
+     * user owns nothing) or the 409 already-paused case — inspect
+     * result.success, result.error and result.reason. Auth (401), rate-limit
+     * (429), network and server (5xx) errors still throw.
+     */
+    PauseResult pause_product(
+        const std::string& app_id,
+        const std::string& discord_id,
+        int days,
+        const std::string& product_id = "",
+        const std::string& reason = "",
+        const std::string& paused_by = "")
+    {
+        nlohmann::json body = {
+            {"app_id", app_id},
+            {"discord_id", discord_id},
+            {"days", days}
+        };
+        if (!product_id.empty()) body["product_id"] = product_id;
+        if (!reason.empty()) body["reason"] = reason;
+        if (!paused_by.empty()) body["paused_by"] = paused_by;
+
+        auto rr = request_raw("POST", "/api/v1/products/pause", body);
+        const nlohmann::json& resp = rr.second;
+        PauseResult r;
+        r.status = rr.first;
+        r.success = resp.value("success", rr.first >= 200 && rr.first < 300);
+        r.error = resp.value("error", "");
+        r.reason = resp.value("reason", "");
+        r.message = resp.value("message", "");
+        if (resp.contains("paused") && resp["paused"].is_array()) {
+            for (const auto& p : resp["paused"]) {
+                PausedProduct pp;
+                pp.product_id = p.value("product_id", "");
+                pp.paused_at = p.value("paused_at", "");
+                pp.pause_ends_at = (p.contains("pause_ends_at") && !p["pause_ends_at"].is_null())
+                    ? p["pause_ends_at"].get<std::string>() : "";
+                pp.frozen_expires_at = (p.contains("frozen_expires_at") && !p["frozen_expires_at"].is_null())
+                    ? p["frozen_expires_at"].get<std::string>() : "";
+                r.paused.push_back(pp);
+            }
+        }
+        return r;
+    }
+
+    /**
+     * Unpause one product — or every paused product on the app when product_id
+     * is empty. Idempotent. Requires a FULL API key. Same error semantics as
+     * pause_product().
+     */
+    UnpauseResult unpause_product(
+        const std::string& app_id,
+        const std::string& discord_id,
+        const std::string& product_id = "")
+    {
+        nlohmann::json body = {
+            {"app_id", app_id},
+            {"discord_id", discord_id}
+        };
+        if (!product_id.empty()) body["product_id"] = product_id;
+
+        auto rr = request_raw("POST", "/api/v1/products/unpause", body);
+        const nlohmann::json& resp = rr.second;
+        UnpauseResult r;
+        r.status = rr.first;
+        r.success = resp.value("success", rr.first >= 200 && rr.first < 300);
+        r.error = resp.value("error", "");
+        r.reason = resp.value("reason", "");
+        if (resp.contains("unpaused") && resp["unpaused"].is_array()) {
+            for (const auto& u : resp["unpaused"]) {
+                UnpausedProduct up;
+                up.product_id = u.value("product_id", "");
+                up.new_expires_at = (u.contains("new_expires_at") && !u["new_expires_at"].is_null())
+                    ? u["new_expires_at"].get<std::string>() : "";
+                r.unpaused.push_back(up);
+            }
+        }
+        return r;
+    }
+
+    /**
+     * Clear the HWID binding(s) for a user on one product — or every product
+     * the user owns on the app when product_id is empty — so they can re-bind
+     * on a new machine. Idempotent for unbound products.
+     *
+     * The app's HWID reset cooldown applies (same rule as dashboard and
+     * self-service resets): blocked products are skipped with
+     * on_cooldown = true, and the call returns 409 cooldown_active when every
+     * target was blocked. Pass bypass_cooldown = true for an explicit admin
+     * override. Pass hwid (with product_id) to clear a single device slot.
+     *
+     * Requires a FULL API key; scoped keys need the devices:reset scope.
+     * Resets are attributed to the calling key in the reset and audit logs.
+     * Same error semantics as pause_product().
+     */
+    ResetHwidResult reset_hwid(
+        const std::string& app_id,
+        const std::string& discord_id,
+        const std::string& product_id = "",
+        const std::string& hwid = "",
+        bool bypass_cooldown = false,
+        const std::string& reason = "")
+    {
+        nlohmann::json body = {
+            {"app_id", app_id},
+            {"discord_id", discord_id}
+        };
+        if (!product_id.empty()) body["product_id"] = product_id;
+        if (!hwid.empty()) body["hwid"] = hwid;
+        if (bypass_cooldown) body["bypass_cooldown"] = true;
+        if (!reason.empty()) body["reason"] = reason;
+
+        auto rr = request_raw("POST", "/api/v1/products/reset-hwid", body);
+        const nlohmann::json& resp = rr.second;
+        ResetHwidResult r;
+        r.status = rr.first;
+        r.success = resp.value("success", rr.first >= 200 && rr.first < 300);
+        r.error = resp.value("error", "");
+        r.reason = resp.value("reason", "");
+        r.cooldown_ends_at = resp.value("cooldown_ends_at", "");
+        if (resp.contains("reset") && resp["reset"].is_array()) {
+            for (const auto& e : resp["reset"]) {
+                HwidResetEntry entry;
+                entry.product_id = e.value("product_id", "");
+                entry.cleared_hwids = e.value("cleared_hwids", 0);
+                entry.on_cooldown = e.value("on_cooldown", false);
+                entry.cooldown_ends_at = e.value("cooldown_ends_at", "");
+                r.reset.push_back(entry);
+            }
+        }
+        return r;
+    }
+
 private:
     std::string api_key_;
     std::string base_url_;
@@ -768,12 +962,27 @@ private:
     }
 
     /**
-     * Send an HTTP request and return the parsed JSON response.
+     * Extract a human-readable error message from a parsed error body.
      */
-    nlohmann::json request(
+    static std::string error_message(long http_code, const nlohmann::json& j) {
+        std::string msg = "HTTP " + std::to_string(http_code);
+        if (j.contains("message") && j["message"].is_string()) {
+            msg = j["message"].get<std::string>();
+        } else if (j.contains("error") && j["error"].is_string()) {
+            msg = j["error"].get<std::string>();
+        }
+        return msg;
+    }
+
+    /**
+     * Perform the HTTP call and parse the JSON body. Returns {status, json}.
+     * Throws only on network failure or an unparseable body — status-based
+     * error handling is left to the caller (request / request_raw).
+     */
+    std::pair<long, nlohmann::json> perform(
         const std::string& method,
         const std::string& path,
-        const nlohmann::json& body = nlohmann::json())
+        const nlohmann::json& body)
     {
         std::string url = base_url_ + path;
         std::string response_body;
@@ -792,7 +1001,7 @@ private:
         headers = curl_slist_append(headers, api_key_header.c_str());
         headers = curl_slist_append(headers, "Content-Type: application/json");
         headers = curl_slist_append(headers, "Accept: application/json");
-        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.2.0");
+        headers = curl_slist_append(headers, "User-Agent: AuthCord-Cpp-SDK/1.3.0");
         curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
 
         // Write callback
@@ -831,23 +1040,29 @@ private:
                 std::string("Failed to parse response: ") + e.what());
         }
 
-        // Handle errors
-        if (http_code >= 400) {
-            std::string error_msg = "HTTP " + std::to_string(http_code);
-            if (json_response.contains("message") && json_response["message"].is_string()) {
-                error_msg = json_response["message"].get<std::string>();
-            } else if (json_response.contains("error") && json_response["error"].is_string()) {
-                error_msg = json_response["error"].get<std::string>();
-            }
+        return { http_code, json_response };
+    }
 
+    /**
+     * Send an HTTP request and return the parsed JSON response. Throws on any
+     * HTTP error status (>= 400), mapping 401/429 to typed exceptions.
+     */
+    nlohmann::json request(
+        const std::string& method,
+        const std::string& path,
+        const nlohmann::json& body = nlohmann::json())
+    {
+        auto rr = perform(method, path, body);
+        long http_code = rr.first;
+
+        if (http_code >= 400) {
+            std::string error_msg = error_message(http_code, rr.second);
             if (http_code == 401) {
                 throw AuthenticationError(error_msg);
             } else if (http_code == 429) {
                 int retry_after = 60;
-                // Note: Retry-After from headers is not easily accessible via libcurl
-                // after the request; use the response body if available.
-                if (json_response.contains("retry_after") && json_response["retry_after"].is_number()) {
-                    retry_after = json_response["retry_after"].get<int>();
+                if (rr.second.contains("retry_after") && rr.second["retry_after"].is_number()) {
+                    retry_after = rr.second["retry_after"].get<int>();
                 }
                 throw RateLimitError(error_msg, retry_after);
             } else {
@@ -855,7 +1070,36 @@ private:
             }
         }
 
-        return json_response;
+        return rr.second;
+    }
+
+    /**
+     * Like request(), but for admin endpoints whose 404/409 responses carry a
+     * meaningful JSON body ({success, error, reason}). Returns {status, body}
+     * instead of throwing on those. Still throws on auth (401), rate-limit
+     * (429) and server (5xx) errors (network/parse throw inside perform()).
+     */
+    std::pair<long, nlohmann::json> request_raw(
+        const std::string& method,
+        const std::string& path,
+        const nlohmann::json& body = nlohmann::json())
+    {
+        auto rr = perform(method, path, body);
+        long http_code = rr.first;
+
+        if (http_code == 401) {
+            throw AuthenticationError(error_message(http_code, rr.second));
+        } else if (http_code == 429) {
+            int retry_after = 60;
+            if (rr.second.contains("retry_after") && rr.second["retry_after"].is_number()) {
+                retry_after = rr.second["retry_after"].get<int>();
+            }
+            throw RateLimitError(error_message(http_code, rr.second), retry_after);
+        } else if (http_code >= 500) {
+            throw ApiError(error_message(http_code, rr.second), static_cast<int>(http_code));
+        }
+
+        return rr;
     }
 
     // ─── Parsing helpers ────────────────────────────────────────────────────

@@ -146,3 +146,33 @@ The SDK throws typed exceptions:
 - `AuthenticationError` -- invalid API key (HTTP 401)
 - `RateLimitError` -- rate limited (HTTP 429), includes `retry_after` field
 - `ApiError` -- other HTTP errors, includes `status_code` field
+
+## Admin operations (server-side, FULL key only)
+
+`pause_product`, `unpause_product` and `reset_hwid` mutate user state and
+require a **FULL** API key (a CLIENT key is rejected with 403). They do **not**
+throw on the expected "not found" cases — inspect `.success`, `.error` (machine
+code) and `.reason` (human string). Leave `product_id` empty to apply to every
+product the user owns on the app.
+
+`reset_hwid` respects the app's HWID reset cooldown (blocked products are
+skipped with `on_cooldown = true`; 409 `cooldown_active` when every target was
+blocked). Pass `bypass_cooldown = true` for an admin override, `hwid` to clear
+one device slot, and `reason` for the reset log. Scoped API keys need the
+`devices:reset` scope; resets are attributed to the calling key.
+
+```cpp
+auto res = client.pause_product("app_id", "discord_id", /*days=*/7,
+                                /*product_id=*/"", "chargeback hold", "discord:999");
+if (res.success) {
+    // res.paused is a std::vector<PausedProduct>
+} else if (res.error == "user_not_found") {
+    // pre-cutover case: res.reason holds the human string
+} else {
+    // res.status, res.error, res.reason
+}
+
+client.unpause_product("app_id", "discord_id"); // all products
+client.reset_hwid("app_id", "discord_id");       // cooldown-gated, idempotent
+client.reset_hwid("app_id", "discord_id", "", "", /*bypass_cooldown=*/true, "ticket #123");
+```

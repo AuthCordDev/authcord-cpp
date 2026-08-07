@@ -6,7 +6,7 @@ int main() {
         authcord::AuthCordClient client("dax_your_api_key");
 
         // Validate a user
-        auto result = client.validate("123456789", "your_app_id", "", "HWID-123");
+        auto result = client.validate("your_app_id", "123456789", "", "", "", "HWID-123");
 
         if (result.valid) {
             std::cout << "Welcome " << result.user.value().username << "!" << std::endl;
@@ -21,7 +21,7 @@ int main() {
         }
 
         // Create a session
-        auto session = client.create_session("123456789", "your_app_id", "HWID-123", "Work PC");
+        auto session = client.create_session("your_app_id", "HWID-123", "123456789", "", "", "Work PC");
         std::cout << "Session token: " << session.session_token << std::endl;
 
         // Validate with session
