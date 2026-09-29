@@ -677,9 +677,10 @@ private:
 
 /** Milliseconds left until `deadline` (0 once it has passed), capped at one minute per wait. */
 inline int ms_until(std::chrono::steady_clock::time_point deadline) {
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    using rep = std::chrono::milliseconds::rep;
+    const rep ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now()).count();
-    return ms <= 0 ? 0 : static_cast<int>((std::min)(ms, static_cast<decltype(ms)>(60000)));
+    return ms <= 0 ? 0 : static_cast<int>((std::min)(ms, rep{60000}));
 }
 
 /**
