@@ -34,6 +34,7 @@ mkdir build && cd build
 cmake ..
 cmake --build .
 ./authcord_example
+ctest --output-on-failure   # runs tests/hosted_login_test.cpp
 ```
 
 ## Usage
@@ -59,6 +60,45 @@ int main() {
     }
 }
 ```
+
+## Hosted Login (desktop apps without a server)
+
+If your app has no backend of its own, let AuthCord run the Discord sign-in. The user signs in in their browser, and your app gets a device session for the Discord account AuthCord verified. Your app ships only a **CLIENT** key and never has to say who the user is — a Discord ID sent by the app itself can be forged, because Discord IDs are public. (`create_session()` needs a FULL key and belongs on your own server.)
+
+Turn it on per app in the dashboard: **Settings → Hosted Login**.
+
+```cpp
+#include "authcord.hpp"
+#include <iostream>
+
+authcord::AuthCordClient client("dax_your_client_key");
+
+try {
+    auto login = client.hosted_login("your_app_id", "HWID-ABC", /*device_name=*/"Work PC");
+    std::cout << "Signed in as " << login.user.username << std::endl;
+    // keep login.session_token (e.g. in the OS keychain) for later launches
+} catch (const authcord::HostedLoginError& e) {
+    std::cerr << "Sign-in did not complete: " << e.code << std::endl;  // access_denied, timeout, ...
+}
+```
+
+`hosted_login()` opens the default browser at AuthCord's sign-in page and listens on `http://127.0.0.1:<random port>/callback` for the redirect back. It checks `state`, redeems the one-time code with PKCE, and returns the session. It blocks until the user finishes or `timeout_seconds` (default 120) passes, so call it off your UI thread.
+
+- The last argument, `open_browser`, receives the sign-in URL instead of opening the default browser, so you can open it yourself or show it in your UI: `client.hosted_login(app_id, hwid, "Work PC", 120, [](const std::string& url) { ... })`.
+- `HostedLoginError::code` is `access_denied` (the user cancelled), `unauthorized_client` (hosted login is off for this app), `timeout`, `state_mismatch`, `invalid_request` or `server_error`.
+- `ApiError` is thrown when AuthCord refuses the code (`e.code == "invalid_grant"`, e.g. it expired after 60 seconds) or the user is banned or owns no active product (403). `RateLimitError` (429) means the user already has 10 active sessions; revoke one first.
+
+Use the session token for everything afterwards. All of these work with a CLIENT key:
+
+```cpp
+const std::string& token = login.session_token;
+client.validate_session(token, "HWID-ABC");                                  // on each launch
+auto loop = client.start_heartbeat("your_app_id", on_terminated, "", "", token); // real-time kick
+client.get_offline_token_for_session("your_app_id", token);                  // offline mode
+client.revoke_session(token);                                                // sign out
+```
+
+Self-contained: PKCE's SHA-256 is built in, so there is no OpenSSL dependency. On Windows the header links `Ws2_32`, `Shell32` and `Bcrypt` through `#pragma comment(lib)` under MSVC; with MinGW, add `-lws2_32 -lshell32 -lbcrypt -ladvapi32`. Full example: `examples/hosted_login.cpp`.
 
 ## Spoofer-resistant HWID (v1.2+)
 
@@ -145,7 +185,8 @@ The SDK throws typed exceptions:
 - `AuthCordError` -- base class for all errors
 - `AuthenticationError` -- invalid API key (HTTP 401)
 - `RateLimitError` -- rate limited (HTTP 429), includes `retry_after` field
-- `ApiError` -- other HTTP errors, includes `status_code` field
+- `ApiError` -- other HTTP errors, includes `status_code` and the server's machine-readable `code` (e.g. `invalid_grant`), when it sends one
+- `HostedLoginError` -- `hosted_login()` ended without a code; includes `code` and `description`
 
 ## Admin operations (server-side, FULL key only)
 
